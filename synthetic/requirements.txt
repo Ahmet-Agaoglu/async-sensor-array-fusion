@@ -1,0 +1,4 @@
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+numba>=0.59  # optional accelerator; suite falls back to pure Python without it
