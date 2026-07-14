@@ -7,10 +7,10 @@ Sensors).
 ## Repository layout
 
 ```
-synthetic/          Synthetic experiment suite (Section 4 of the paper)
+synthetic/          Synthetic experiment suite
     run_experiments.py
     requirements.txt
-hardware/           Hardware-experiment analysis (Section 5)
+hardware/           Hardware-experiment analysis and array recordings
     analyse_real_experiment.py
     data/           16-sensor MPU9250 array recordings (CSV)
 ```
@@ -47,17 +47,19 @@ Options: `--runs`, `--sweep-runs`, `--signals cos fluct ramp`, `--seed`,
 `--no-sweeps`. All console tables and per-run RMSE values are also written
 to `results/results.json`.
 
-### Outputs → paper mapping
+### Outputs
 
-| File | Paper item |
+Together these regenerate every synthetic table and figure of the paper:
+
+| File | Content |
 |---|---|
-| console tables / `results.json` | Table 1 (mean ± std, median, Wilcoxon p) |
-| `fig_summary.png` | Figure 1 |
-| `fig_sweep_drop.png` | Figure 2 |
-| `fig_sweep_rate.png` | Figure 3 |
-| `fig_sweep_tau.png` | Figure 4 |
-| `fig_sweep_burst.png` | bursty-loss robustness figure (Fig.~\ref{fig:burst}) |
-| `fig_param_<signal>.png` | Figure 5 |
+| console tables / `results.json` | 3-regime × 5-method RMSE comparison (mean ± std, median, Wilcoxon p) |
+| `fig_summary.png` | per-regime RMSE summary bars |
+| `fig_sweep_drop.png` | packet-loss robustness sweep |
+| `fig_sweep_rate.png` | rate-heterogeneity robustness sweep |
+| `fig_sweep_tau.png` | time-delay robustness sweep |
+| `fig_sweep_burst.png` | bursty (Gilbert–Elliott) loss robustness sweep |
+| `fig_param_<signal>.png` | parameter-identification accuracy scatter |
 
 ### Notes on reproducibility
 
@@ -68,6 +70,48 @@ to `results/results.json`.
 * The `Nemec (interp)` baseline feeds the synchronous method with an
   offline (non-causal) linear-interpolation reconstruction — the strongest
   practical resampling front-end — alongside the causal zero-order hold.
+
+## Hardware experiments
+
+`hardware/analyse_real_experiment.py` reproduces every analysis of the Real
+Experiments section from the three CSV recordings of the 16-sensor MPU9250
+array: the two-reference RMSE comparison, the encoder-reference resolution
+study, the per-sensor parameter and convergence figures, the runtime
+statistics, and the asynchrony/packet-loss replay sweeps on the recorded
+event streams.
+
+### Run
+
+```bash
+cd hardware
+python analyse_real_experiment.py data/real_cos.csv data/real_fluct.csv \
+       data/real_ramp.csv --outdir results          # ~2 min
+```
+
+Options: `--gt-win`, `--gt-win-corrected`, `--windows`, `--seeds`,
+`--sweep-signal`, `--no-sweeps`. All numerical results are also written to
+`results/real_results.json`.
+
+### Outputs
+
+Together these regenerate every table and figure of the paper's hardware
+section:
+
+| File | Content |
+|---|---|
+| `real_results.json` | RMSE against both encoder references, reference-window study, calibration statistics, timing |
+| `real_<profile>_1.png` | fused velocity and error against the encoder reference |
+| `real_<profile>_2.png` | estimated per-sensor gain, bias, and timing offset |
+| `real_<profile>_3.png` | filter convergence diagnostics |
+| `fig_real_sweep_drop_fluct.png` | replayed i.i.d. packet-loss sweep |
+| `fig_real_sweep_burst_fluct.png` | replayed bursty packet-loss sweep |
+
+### Data format
+
+Each CSV holds one row per control loop:
+`t_enc_us, enc_deg, t1_us, y1, ..., t16_us, y16` — encoder angle in degrees,
+per-sensor angular rates in deg/s, and all time stamps in microseconds from
+the shared microcontroller clock.
 
 ## License
 
