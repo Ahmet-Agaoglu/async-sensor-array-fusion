@@ -1,4 +1,4 @@
-# Asynchronous Self-Calibrating Sensor Array Fusion — Reproducibility Code
+# Reference-Free Fusion and Self-Calibration of Asynchronous Sensor Arrays with Online Time-Delay Estimation — Reproducibility Code
 
 Code and data accompanying the manuscript *"Asynchronous Self-Calibrating
 Sensor Array Fusion with Online Time-Delay Estimation"* (submitted to MDPI
