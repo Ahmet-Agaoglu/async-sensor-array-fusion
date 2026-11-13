@@ -2,8 +2,9 @@
 # =========================================================================
 # REAL-EXPERIMENT ANALYSIS
 #
-# Reproduces every analysis of the Real Experiments section from the three
-# CSV recordings of the 16-sensor MPU9250 array:
+# Reproduces every analysis of the Real Experiments section from the thirty
+# CSV recordings of the 16-sensor MPU9250 array (three motion profiles,
+# ten repetitions each):
 #
 #   A. BASELINE ANALYSIS: fused RMSE against the encoder reference,
 #      per-sensor parameter estimates, convergence diagnostics, timing.
@@ -19,8 +20,14 @@
 #      Nemec (interp), and the proposed method on real measurements.
 #
 # Usage:
-#   python analyse_real_experiment.py data/real_cos.csv data/real_fluct.csv \
-#          data/real_ramp.csv --outdir results
+#   python analyse_real_experiment.py data/real_*_rep*.csv --outdir results \
+#          --no-sweeps
+#   python analyse_real_experiment.py data/real_fluct_rep1.csv \
+#          --outdir results --sweep-signal fluct_rep1
+#
+# Defaults: --attribution midpoint --warmup 0.5 --timing-reps 25.
+# The windowed difference is attributed to the midpoint of the interval it
+# spans; --attribution index reproduces the earlier index-based placement.
 #
 # The estimator core (_kf_pass, fuse_nemec, ...) is imported from the
 # synthetic suite so that exactly one implementation exists in the repo.
@@ -30,12 +37,19 @@ import argparse
 import importlib.util
 import json
 import os
+import platform
+import subprocess
+import sys
 import time
 
 import numpy as np
+from scipy.interpolate import interp1d
 
 import matplotlib
 matplotlib.use("Agg")
+# Vector PDF output. fonttype 42 embeds TrueType rather than Type 3,
+# which some publishers reject.
+matplotlib.rcParams["pdf.fonttype"] = 42
 import matplotlib.pyplot as plt
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +64,61 @@ except Exception:  # pragma: no cover
     synth._kf_pass = synth._kf_pass_py
 
 EPS = np.finfo(float).eps
+
+
+# =========================================================================
+# COMPUTING ENVIRONMENT
+#
+# Reported alongside every timing figure: processor, core count, operating
+# system, interpreter and library versions, whether the just-in-time
+# compilation of the inner recursion is active, and the thread-count
+# environment variables in force.
+# =========================================================================
+def _cpu_name():
+    """Processor brand string. platform.processor() returns only the family
+    on Windows and is often empty on Linux, so query the OS directly."""
+    try:
+        if sys.platform.startswith("win"):
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_Processor).Name"],
+                capture_output=True, text=True, timeout=30)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip().splitlines()[0].strip()
+        elif sys.platform == "darwin":
+            out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                 capture_output=True, text=True, timeout=30)
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+        else:
+            with open("/proc/cpuinfo") as fh:
+                for line in fh:
+                    if line.lower().startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+    except Exception:  # pragma: no cover
+        pass
+    return platform.processor() or "unknown"
+
+
+def _environment():
+    """Everything a reader needs to interpret the timing figures."""
+    env = dict(cpu=_cpu_name(),
+               logical_cores=os.cpu_count(),
+               machine=platform.machine(),
+               platform=platform.platform(),
+               python=platform.python_version(),
+               python_impl=platform.python_implementation(),
+               numpy=np.__version__)
+    for mod in ("scipy", "numba", "matplotlib"):
+        try:
+            env[mod] = __import__(mod).__version__
+        except Exception:  # pragma: no cover
+            env[mod] = None
+    env["jit_active"] = synth._kf_pass is not synth._kf_pass_py
+    env["thread_env"] = {k: os.environ.get(k) for k in
+                         ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                          "MKL_NUM_THREADS", "NUMBA_NUM_THREADS")}
+    return env
 
 
 # =========================================================================
@@ -69,15 +138,44 @@ def parse_csv(path):
 
 
 # =========================================================================
-# ENCODER GROUND-TRUTH VELOCITY (window-centre attributed)
+# ENCODER GROUND-TRUTH VELOCITY
+#
+# A difference over a window of w samples estimates the MEAN velocity over
+# that interval, which belongs at the interval centre
+#       t_c = (t[k] + t[k-w]) / 2,
+# a time that falls between two encoder samples whenever w is odd. Writing
+# the quotient to integer index k - floor(w/2), as earlier versions of this
+# script did, therefore attributes it half a sample (0.5/Fs) too late and
+# biases every RMSE taken against it. The reference is instead built on its
+# own centre-time axis and resampled onto the encoder grid.
+#
+# `attribution` selects the convention:
+#   "midpoint" - centre-time axis, resampled (correct; the default)
+#   "index"    - legacy integer-index attribution, retained so that the
+#                previously published figures can be reproduced exactly
+#
+# `warmup_s` blanks the opening `warmup_s` seconds of the record. The window
+# difference cannot follow the rig's start-up acceleration, so the reference
+# itself is unreliable there; blanking it in the reference removes those
+# samples from every method's error on identical terms.
 # =========================================================================
-def encoder_gt(t_enc, enc_deg, Fs, win_s):
+def encoder_gt(t_enc, enc_deg, Fs, win_s, attribution="midpoint",
+               warmup_s=0.0):
     N = t_enc.size
     w_win = int(round(win_s * Fs))
-    w_half = w_win // 2
-    gt = np.full(N, np.nan)
     k = np.arange(w_win, N)
-    gt[k - w_half] = (enc_deg[k] - enc_deg[k - w_win]) / (t_enc[k] - t_enc[k - w_win])
+    rate = (enc_deg[k] - enc_deg[k - w_win]) / (t_enc[k] - t_enc[k - w_win])
+    if attribution == "index":
+        gt = np.full(N, np.nan)
+        gt[k - w_win // 2] = rate
+    elif attribution == "midpoint":
+        t_c = 0.5 * (t_enc[k] + t_enc[k - w_win])
+        gt = np.interp(t_enc, t_c, rate)
+        gt[(t_enc < t_c[0]) | (t_enc > t_c[-1])] = np.nan
+    else:
+        raise ValueError(f"unknown attribution {attribution!r}")
+    if warmup_s > 0.0:
+        gt[t_enc < t_enc[0] + warmup_s] = np.nan
     return gt
 
 
@@ -87,14 +185,18 @@ def encoder_gt(t_enc, enc_deg, Fs, win_s):
 # =========================================================================
 def fuse_proposed_hw(t_enc, Y, T_imu, mask, gmax, bmax, tmax, est_tau,
                      n_iter=8, mu=3.0):
+    _t0 = time.perf_counter()
     N, J = Y.shape
     kk, jj = np.nonzero(mask)
     te = T_imu[kk, jj]
     ye = Y[kk, jj]
     je = jj.astype(np.int64)
+    # Batch-processing artefact: a deployed stream arrives in time order, so
+    # this global sort is timed separately and excluded from the method cost.
     order = np.argsort(te, kind="stable")
     te, ye, je = te[order], ye[order], je[order]
     M = te.size
+    _t_prep = time.perf_counter() - _t0
 
     q = (1.0 / np.median(np.diff(te))) ** 2 * 1e-3
     Ghat = np.ones(J)
@@ -104,9 +206,14 @@ def fuse_proposed_hw(t_enc, Y, T_imu, mask, gmax, bmax, tmax, est_tau,
     warm = min(50, M // 10)
 
     dbg = dict(gamma=[], q=[], G_hist=[], B_hist=[], tau_hist=[], M=M)
+    _t_fast = 0.0
+    _t_slow = 0.0
     for _ in range(n_iter):
+        _t = time.perf_counter()
         w_ev, wd_ev, innov2, cnt = synth._kf_pass(te, ye, je, Ghat, Bhat,
                                                   tauhat, Rest, q, warm)
+        _t_fast += time.perf_counter() - _t
+        _t = time.perf_counter()
         ratio = innov2 / cnt if cnt > 0 else np.nan
         if cnt > 0:
             q *= min(max(ratio, 0.3), 3.0) ** 0.7
@@ -141,12 +248,21 @@ def fuse_proposed_hw(t_enc, Y, T_imu, mask, gmax, bmax, tmax, est_tau,
         dbg["G_hist"].append(Ghat.copy())
         dbg["B_hist"].append(Bhat.copy())
         dbg["tau_hist"].append(tauhat.copy() * 1e3)
+        _t_slow += time.perf_counter() - _t
 
+    # Evaluation-only step: the estimator produces its output at event times.
+    # Resampling onto the control-loop grid exists solely to score against the
+    # encoder reference, so it too is timed separately.
+    _t = time.perf_counter()
     te_rev_u, idx_rev = np.unique(te[::-1], return_index=True)
     last_idx = M - 1 - idx_rev
-    from scipy.interpolate import interp1d
     w_grid = interp1d(te_rev_u, w_ev[last_idx], kind="linear",
                       fill_value="extrapolate", assume_sorted=True)(t_enc)
+    _t_resample = time.perf_counter() - _t
+    dbg["timing"] = dict(prep_s=_t_prep, fast_layer_s=_t_fast,
+                         slow_layer_s=_t_slow, resample_s=_t_resample,
+                         method_s=_t_fast + _t_slow,
+                         total_s=_t_prep + _t_fast + _t_slow + _t_resample)
     return w_grid, Ghat, Bhat, tauhat, dbg
 
 
@@ -201,17 +317,39 @@ def rmse_valid(w, gt):
 # A. BASELINE ANALYSIS (paper Table 2 + diagnostics figures)
 # =========================================================================
 def baseline_analysis(tag, t_enc, enc_deg, T_imu, Y, J, Fs, gmax, bmax, tmax,
-                      gt_win, outdir):
-    gt = encoder_gt(t_enc, enc_deg, Fs, gt_win)
+                      gt_win, outdir, attribution="midpoint", warmup_s=0.0,
+                      timing_reps=5):
+    gt = encoder_gt(t_enc, enc_deg, Fs, gt_win, attribution, warmup_s)
     mask = T_imu > 0
-    t0 = time.time()
-    w_prop, G, B, tau, dbg = fuse_proposed_hw(t_enc, Y, T_imu, mask,
-                                              gmax, bmax, tmax, True)
-    t_fuse = time.time() - t0
+    # Timing protocol. One warm-up run is discarded, to force the
+    # just-in-time compilation and fill the caches, and the fusion is then
+    # repeated `timing_reps` times. Wall-clock on a general-purpose
+    # operating system is contaminated by whatever else the machine is
+    # doing -- in a 30-record batch, five consecutive records took two to
+    # three times the median purely from external load -- so the smallest
+    # of the repetitions is reported as the least-contaminated estimate,
+    # the convention of the standard `timeit` module. The full distribution
+    # is kept in `timing_reps_s` so that the contamination is visible.
+    fuse_proposed_hw(t_enc, Y, T_imu, mask, gmax, bmax, tmax, True)
+    reps = []
+    for _ in range(max(1, timing_reps)):
+        t0 = time.perf_counter()
+        w_prop, G, B, tau, dbg = fuse_proposed_hw(t_enc, Y, T_imu, mask,
+                                                  gmax, bmax, tmax, True)
+        reps.append((time.perf_counter() - t0, dbg["timing"]))
+    t_fuse, timing = min(reps, key=lambda r: r[1]["method_s"])
+    t_fuse = min(r[0] for r in reps)
     w_nem = synth.fuse_nemec(synth.zoh_fill(Y, mask), gmax, bmax)
     rp, rn = rmse_valid(w_prop, gt), rmse_valid(w_nem, gt)
+    # Same estimator with delay estimation switched off: isolates the
+    # contribution of the delay term. Outside the timing block above, so the
+    # reported fusion times are unaffected.
+    w_nt, *_ = fuse_proposed_hw(t_enc, Y, T_imu, mask, gmax, bmax, tmax, False)
+    rp_nt = rmse_valid(w_nt, gt)
 
-    out = dict(rmse_proposed=rp, rmse_nemec=rn,
+    out = dict(rmse_proposed=rp, rmse_proposed_notau=rp_nt, rmse_nemec=rn,
+               gt_win_s=gt_win, attribution=attribution, warmup_s=warmup_s,
+               n_eval=int(np.count_nonzero(~np.isnan(gt))),
                gain=dict(mean=float(G.mean()), std=float(G.std(ddof=1)),
                          min=float(G.min()), max=float(G.max())),
                bias=dict(mean=float(B.mean()), std=float(B.std(ddof=1)),
@@ -226,8 +364,14 @@ def baseline_analysis(tag, t_enc, enc_deg, T_imu, Y, J, Fs, gmax, bmax, tmax,
                spec_ok_bias=int(np.sum(np.abs(B) <= bmax)),
                gamma_final=dbg["gamma"][-1], q_final=dbg["q"][-1],
                M=dbg["M"], fuse_time_s=t_fuse,
+               timing=timing, timing_reps=len(reps),
+               timing_reps_s=[r[1]["method_s"] for r in reps],
                us_per_event_total=t_fuse / dbg["M"] / 8 * 1e6,
-               realtime_factor=float((t_enc[-1] - t_enc[0]) / t_fuse))
+               us_per_event_method=(timing["method_s"]
+                                    / dbg["M"] / 8 * 1e6),
+               realtime_factor=float((t_enc[-1] - t_enc[0]) / t_fuse),
+               realtime_factor_method=float((t_enc[-1] - t_enc[0])
+                                            / timing["method_s"]))
 
     # ---- figures (fusion overlay, parameter bars, convergence) ----
     v = ~np.isnan(gt)
@@ -248,7 +392,7 @@ def baseline_analysis(tag, t_enc, enc_deg, T_imu, Y, J, Fs, gmax, bmax, tmax,
     ax[1].set_xlabel("time (s)")
     ax[1].legend(loc="best", fontsize=8)
     ax[1].grid(alpha=0.4)
-    fig.savefig(os.path.join(outdir, f"real_{tag}_1.png"), dpi=200)
+    fig.savefig(os.path.join(outdir, f"real_{tag}_1.pdf"))
     plt.close(fig)
 
     idx = np.arange(1, J + 1)
@@ -275,7 +419,7 @@ def baseline_analysis(tag, t_enc, enc_deg, T_imu, Y, J, Fs, gmax, bmax, tmax,
     for a in axs:
         a.grid(alpha=0.4)
     fig.suptitle("Estimated per-sensor parameters")
-    fig.savefig(os.path.join(outdir, f"real_{tag}_2.png"), dpi=200)
+    fig.savefig(os.path.join(outdir, f"real_{tag}_2.pdf"))
     plt.close(fig)
 
     it = np.arange(1, len(dbg["gamma"]) + 1)
@@ -303,7 +447,7 @@ def baseline_analysis(tag, t_enc, enc_deg, T_imu, Y, J, Fs, gmax, bmax, tmax,
     for a in axs:
         a.grid(alpha=0.4)
     fig.suptitle("Filter convergence diagnostics")
-    fig.savefig(os.path.join(outdir, f"real_{tag}_3.png"), dpi=200)
+    fig.savefig(os.path.join(outdir, f"real_{tag}_3.pdf"))
     plt.close(fig)
     return out
 
@@ -312,19 +456,21 @@ def baseline_analysis(tag, t_enc, enc_deg, T_imu, Y, J, Fs, gmax, bmax, tmax,
 # B. ENCODER-REFERENCE STUDY
 # =========================================================================
 def reference_study(tag, t_enc, enc_deg, T_imu, Y, Fs, gmax, bmax, tmax,
-                    windows, outdir):
+                    windows, outdir, attribution="midpoint", warmup_s=0.0):
     mask = T_imu > 0
     w_prop, *_ = fuse_proposed_hw(t_enc, Y, T_imu, mask, gmax, bmax, tmax, True)
     w_nem = synth.fuse_nemec(synth.zoh_fill(Y, mask), gmax, bmax)
     rows = []
     for win in windows:
-        gt = encoder_gt(t_enc, enc_deg, Fs, win)
+        gt = encoder_gt(t_enc, enc_deg, Fs, win, attribution, warmup_s)
         rows.append(dict(window_s=win,
                          rmse_proposed=rmse_valid(w_prop, gt),
                          rmse_nemec=rmse_valid(w_nem, gt)))
     # empirical reference-smoothing error: long-window GT vs short-window GT
-    gt_long = encoder_gt(t_enc, enc_deg, Fs, windows[0])
-    gt_short = encoder_gt(t_enc, enc_deg, Fs, windows[-1])
+    gt_long = encoder_gt(t_enc, enc_deg, Fs, windows[0],
+                         attribution, warmup_s)
+    gt_short = encoder_gt(t_enc, enc_deg, Fs, windows[-1],
+                          attribution, warmup_s)
     v = ~np.isnan(gt_long) & ~np.isnan(gt_short)
     smoothing_rms = float(np.sqrt(np.mean((gt_long[v] - gt_short[v]) ** 2)))
     return dict(rows=rows, smoothing_rms_long_vs_short=smoothing_rms)
@@ -334,9 +480,10 @@ def reference_study(tag, t_enc, enc_deg, T_imu, Y, Fs, gmax, bmax, tmax,
 # C. EMULATED ASYNCHRONY ON THE RECORDED DATA
 # =========================================================================
 def replay_sweeps(tag, t_enc, enc_deg, T_imu, Y, Fs, gmax, bmax, tmax,
-                  gt_win, n_seeds, outdir):
+                  gt_win, n_seeds, outdir, attribution="midpoint",
+                  warmup_s=0.0):
     N, J = Y.shape
-    gt = encoder_gt(t_enc, enc_deg, Fs, gt_win)
+    gt = encoder_gt(t_enc, enc_deg, Fs, gt_win, attribution, warmup_s)
 
     def run_point(p_drop, burst_len, seed):
         rng = np.random.default_rng([seed, int(p_drop * 1000), burst_len])
@@ -357,7 +504,7 @@ def replay_sweeps(tag, t_enc, enc_deg, T_imu, Y, Fs, gmax, bmax, tmax,
                               proposed=res[:, :, 2].mean(1).tolist())
     _plot_sweep([d * 100 for d in drops], res, "packet loss (%)",
                 "Recorded data: robustness to packet loss",
-                os.path.join(outdir, f"fig_real_sweep_drop_{tag}.png"))
+                os.path.join(outdir, f"fig_real_sweep_drop_{tag}.pdf"))
 
     bursts = [1, 12, 30, 60, 120]               # loops (~8.5 ms each)
     resb = np.array([[run_point(0.2, L, s) for s in range(n_seeds)]
@@ -369,7 +516,7 @@ def replay_sweeps(tag, t_enc, enc_deg, T_imu, Y, Fs, gmax, bmax, tmax,
                               proposed=resb[:, :, 2].mean(1).tolist())
     _plot_sweep(x_ms, resb, "mean burst length (ms) at 20% loss",
                 "Recorded data: robustness to bursty packet loss",
-                os.path.join(outdir, f"fig_real_sweep_burst_{tag}.png"))
+                os.path.join(outdir, f"fig_real_sweep_burst_{tag}.pdf"))
     return out
 
 
@@ -387,7 +534,7 @@ def _plot_sweep(x, res, xlabel, title, path):
     ax.set_title(title)
     ax.grid(alpha=0.4)
     ax.legend(loc="upper left", fontsize=8)
-    fig.savefig(path, dpi=200)
+    fig.savefig(path)
     plt.close(fig)
 
 
@@ -409,13 +556,48 @@ def main():
     ap.add_argument("--sweep-signal", default="fluct",
                     help="tag of the recording used for the replay sweeps")
     ap.add_argument("--no-sweeps", action="store_true")
+    ap.add_argument("--attribution", choices=("midpoint", "index"),
+                    default="midpoint",
+                    help="encoder finite-difference attribution convention; "
+                         "'index' reproduces the previously published figures")
+    ap.add_argument("--warmup", type=float, default=0.5,
+                    help="seconds blanked at the start of each record [s]")
+    ap.add_argument("--timing-reps", type=int, default=5,
+                    help="timed repetitions per record; the fastest is "
+                         "reported (external load only ever adds time)")
     args = ap.parse_args()
 
     gmax, bmax, tmax = 0.03, 5.0, 10e-3        # spec limits at +25 C
     os.makedirs(args.outdir, exist_ok=True)
-    results = dict(spec=dict(gmax=gmax, bmax=bmax, tmax_ms=tmax * 1e3),
+
+    env = _environment()
+    # Time the just-in-time compilation on its own, so that it is never
+    # folded into a reported fusion cost.
+    try:
+        _z = np.zeros(4)
+        _t = time.perf_counter()
+        synth._kf_pass(_z, _z, np.zeros(4, dtype=np.int64), np.ones(1),
+                       np.zeros(1), np.zeros(1), np.full(1, 0.01), 1e3, 1)
+        env["jit_compile_s"] = time.perf_counter() - _t
+    except Exception as exc:  # pragma: no cover
+        env["jit_compile_s"] = None
+        env["jit_compile_note"] = repr(exc)
+    print("Environment: %s (%s logical cores), %s, Python %s, "
+          "NumPy %s, SciPy %s, Numba %s, JIT %s"
+          % (env["cpu"], env["logical_cores"], env["platform"], env["python"],
+             env["numpy"], env["scipy"], env["numba"],
+             "on" if env["jit_active"] else "off"))
+    if env.get("jit_compile_s") is not None:
+        print("JIT compilation of the inner recursion: %.3f s "
+              "(excluded from all reported fusion times)"
+              % env["jit_compile_s"])
+
+    results = dict(environment=env,
+                   spec=dict(gmax=gmax, bmax=bmax, tmax_ms=tmax * 1e3),
                    gt_win_original=args.gt_win,
-                   gt_win_corrected=args.gt_win_corrected, profiles={})
+                   gt_win_corrected=args.gt_win_corrected,
+                   attribution=args.attribution, warmup_s=args.warmup,
+                   profiles={})
 
     for path in args.csvfiles:
         tag = os.path.splitext(os.path.basename(path))[0].replace("real_", "")
@@ -424,13 +606,15 @@ def main():
         prof = {}
         prof["original_reference"] = baseline_analysis(
             tag + "_orig", t_enc, enc_deg, T_imu, Y, J, Fs,
-            gmax, bmax, tmax, args.gt_win, args.outdir)
+            gmax, bmax, tmax, args.gt_win, args.outdir,
+            args.attribution, args.warmup, args.timing_reps)
         prof["corrected_reference"] = baseline_analysis(
             tag, t_enc, enc_deg, T_imu, Y, J, Fs,
-            gmax, bmax, tmax, args.gt_win_corrected, args.outdir)
+            gmax, bmax, tmax, args.gt_win_corrected, args.outdir,
+            args.attribution, args.warmup, args.timing_reps)
         prof["reference_study"] = reference_study(
             tag, t_enc, enc_deg, T_imu, Y, Fs, gmax, bmax, tmax,
-            args.windows, args.outdir)
+            args.windows, args.outdir, args.attribution, args.warmup)
         for key in ("original_reference", "corrected_reference"):
             b = prof[key]
             print(f"  [{key:20s}] RMSE prop={b['rmse_proposed']:.3f} "
@@ -439,7 +623,8 @@ def main():
         if (not args.no_sweeps) and tag == args.sweep_signal:
             prof["replay"] = replay_sweeps(
                 tag, t_enc, enc_deg, T_imu, Y, Fs, gmax, bmax, tmax,
-                args.gt_win_corrected, args.seeds, args.outdir)
+                args.gt_win_corrected, args.seeds, args.outdir,
+                args.attribution, args.warmup)
         results["profiles"][tag] = prof
 
     with open(os.path.join(args.outdir, "real_results.json"), "w") as fh:
